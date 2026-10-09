@@ -9,8 +9,7 @@
 #include <Windows.h>
 #include <string>
 #include <regex>
-
-#include <rpc.h>
+#include <algorithm>
 
 #include <DShow.h>
 
@@ -31,7 +30,8 @@
 #include "CIniFileAccess.h"
 #include "WaitWithMsg.h"
 
-#pragma comment(lib, "Rpcrt4.lib")
+#pragma comment(lib, "Strmiids.lib")
+#pragma comment(lib, "ksproxy.lib")
 
 #ifdef _DEBUG
 #pragma comment(lib, "strmbasd.lib")
@@ -42,6 +42,19 @@
 #pragma comment(lib, "winmm.lib")
 
 FILE *g_fpLog = NULL;
+
+//////////////////////////////////////////////////////////////////////
+// TBS拡張プロパティ
+//////////////////////////////////////////////////////////////////////
+
+// TBS拡張プロパティのプロパティセット
+//   BdaSpecials\TBS\TBSSpecials.h の KSPROPSETID_BdaTunerExtensionProperties と同じ値
+static const GUID TBS_KSPROPSETID_BdaTunerExtensionProperties =
+	{ 0xfaa8f3e5, 0x31d4, 0x4e41, { 0x88, 0xef, 0xd9, 0xeb, 0x71, 0x6f, 0x6e, 0xc9 } };
+
+// 信号強度/SNR/BERを取得するプロパティID
+//   BdaSpecials\TBS\TBSSpecials.h の KSPROPERTY_BDA_SIGNAL_STATUS (=6)
+static constexpr DWORD TBS_KSPROPERTY_BDA_SIGNAL_STATUS = 6UL;
 
 //////////////////////////////////////////////////////////////////////
 // 静的メンバ変数
@@ -108,25 +121,23 @@ CBonTuner::CBonTuner()
 	m_nSignalLevelCalcType(eSignalLevelCalcTypeSSStrength),
 	m_bSignalLevelGetTypeSS(FALSE),
 	m_bSignalLevelGetTypeTuner(FALSE),
-	m_bSignalLevelGetTypeDemodSS(FALSE),
+	m_bSignalLevelGetTypeTBS(FALSE),
 	m_bSignalLevelGetTypeBR(FALSE),
 	m_bSignalLevelNeedStrength(FALSE),
 	m_bSignalLevelNeedQuality(FALSE),
+	m_bSignalLevelCalcTypeMul(FALSE),
+	m_bSignalLevelCalcTypeAdd(FALSE),
 	m_fStrengthCoefficient(1),
 	m_fQualityCoefficient(1),
 	m_fStrengthBias(0),
 	m_fQualityBias(0),
-	m_fStrength(0),
-	m_fQuality(0),
 	m_nSignalLockedJudgeType(eSignalLockedJudgeTypeSS),
 	m_bSignalLockedJudgeTypeSS(FALSE),
 	m_bSignalLockedJudgeTypeTuner(FALSE),
-	m_bSignalLockedJudgeTypeDemodSS(FALSE),
 	m_nBuffSize(188 * 1024),
 	m_nMaxBuffCount(512),
 	m_nWaitTsCount(1),
 	m_nWaitTsSleep(100),
-	m_bDeleteNullPackets(FALSE),
 	m_bAlwaysAnswerLocked(FALSE),
 	m_nThreadPriorityCOM(THREAD_PRIORITY_ERROR_RETURN),
 	m_nThreadPriorityDecode(THREAD_PRIORITY_ERROR_RETURN),
@@ -140,14 +151,12 @@ CBonTuner::CBonTuner()
 	m_hStreamThread(NULL),
 	m_bIsSetStreamThread(FALSE),
 	m_hSemaphore(NULL),
-	m_hPowerSetFlag(NULL),
-	m_hPowerSetLock(NULL),
-	m_dwROTRegister(0),
+	m_bTBSSignalStatusWithInstanceData(FALSE),
+	m_nTBSSignalStatusLastResult(-1),
 	m_pDSFilterEnumTuner(NULL),
 	m_pDSFilterEnumCapture(NULL),
 	m_nNetworkProvider(eNetworkProviderAuto),
 	m_nDefaultNetwork(eDefaultNetworkSPHD),
-	m_bRegisterGraphInROT(FALSE),
 	m_bOpened(FALSE),
 	m_dwTargetSpace(CBonTuner::SPACE_INVALID),
 	m_dwCurSpace(CBonTuner::SPACE_INVALID),
@@ -155,8 +164,6 @@ CBonTuner::CBonTuner()
 	m_dwCurChannel(CBonTuner::CHANNEL_INVALID),
 	m_nCurTone(CBonTuner::TONE_UNKNOWN),
 	m_bIsEnabledTSMF(FALSE),
-	m_lResetFilter(0),
-	m_PacketSize(0),
 	m_hModuleTunerSpecials(NULL),
 	m_pIBdaSpecials(NULL),
 	m_pIBdaSpecials2(NULL)
@@ -283,12 +290,14 @@ const BOOL CBonTuner::_OpenTuner(void)
 
 		OutputDebug(L"Build graph Successfully.\n");
 
-		// チューナの信号状態取得用インターフェースの取得（失敗しても続行）
 		if (m_bSignalLockedJudgeTypeSS || m_bSignalLevelGetTypeSS) {
-			hr = LoadTunerSignalStatisticsTunerNode();
+			// チューナの信号状態取得用インターフェースの取得（失敗しても続行）
+			hr = LoadTunerSignalStatistics();
 		}
-		if (m_bSignalLockedJudgeTypeDemodSS || m_bSignalLevelGetTypeDemodSS) {
-			hr = LoadTunerSignalStatisticsDemodNode();
+
+		if (m_bSignalLevelGetTypeTBS) {
+			// TBS拡張プロパティ取得用インターフェースの取得（失敗しても続行）
+			hr = LoadTunerTBSSignalStatus();
 		}
 
 		// TS受信イベント作成
@@ -307,8 +316,6 @@ const BOOL CBonTuner::_OpenTuner(void)
 
 		// コールバック関数セット
 		StartRecv();
-
-		PowerSetOnOpened();
 
 		m_bOpened = TRUE;
 
@@ -347,8 +354,6 @@ void CBonTuner::_CloseTuner(void)
 {
 	m_bOpened = FALSE;
 
-	PowerSetOnClosing();
-
 	// グラフ停止
 	StopGraph();
 
@@ -374,6 +379,9 @@ void CBonTuner::_CloseTuner(void)
 
 	// チューナの信号状態取得用インターフェース解放
 	UnloadTunerSignalStatistics();
+
+	// TBS拡張プロパティ取得用インターフェース解放
+	UnloadTunerTBSSignalStatus();
 
 	// グラフ解放
 	CleanupGraph();
@@ -451,25 +459,44 @@ const float CBonTuner::_GetSignalLevel(void)
 
 	if (m_dwTargetChannel == CBonTuner::CHANNEL_INVALID)
 		// SetChannel()が一度も呼ばれていない場合は0を返す
-		return 0.0F;
+		return 0;
 
 	GetSignalState(&nStrength, &nQuality, &nLock);
 	if (!nLock)
 		// Lock出来ていない場合は0を返す
-		return 0.0F;
+		return 0;
+
+	// TBS拡張プロパティ(KSPROPERTY_BDA_SIGNAL_STATUS)の値を使用する場合
+	if (m_bSignalLevelGetTypeTBS) {
+		TBSSignalStatus status;
+		if (FAILED(hr = GetTBSSignalStatus(&status)))
+			// 取得出来なかった場合は0を返す
+			return 0;
+		switch (m_nSignalLevelCalcType) {
+		case eSignalLevelCalcTypeTBSStrength:
+			// 信号強度(dBm)
+			return (float)((double)status.lStrength / m_fStrengthCoefficient + m_fStrengthBias);
+		case eSignalLevelCalcTypeTBSQuality:
+			// SNR(0.1dB単位の値をdBに換算)
+			return (float)((double)status.lSNR / 10.0 / m_fQualityCoefficient + m_fQualityBias);
+		default:
+			return 0;
+		}
+	}
+
 	if (nStrength < 0 && m_bSignalLevelNeedStrength)
 		// Strengthは-1を返す場合がある
 		return (float)nStrength;
+	double s = 0.0;
+	double q = 0.0;
+	if (m_bSignalLevelNeedStrength)
+		s = (double)nStrength / m_fStrengthCoefficient + m_fStrengthBias;
+	if (m_bSignalLevelNeedQuality)
+		q = (double)nQuality / m_fQualityCoefficient + m_fQualityBias;
 
-	m_fStrength = (double)nStrength;
-	m_fQuality = (double)nQuality;
-
-	try {
-		f = (float)m_muParser.Eval();
-	}
-	catch (...) {
-	}
-	return f;
+	if (m_bSignalLevelCalcTypeMul)
+		return (float)(s * q);
+	return (float)(s + q);
 }
 
 const DWORD CBonTuner::WaitTsStream(const DWORD dwTimeOut)
@@ -538,9 +565,6 @@ void CBonTuner::PurgeTsStream(void)
 
 	// デコード後TSバッファ
 	m_DecodedTsBuff.Purge();
-
-	// ヌルパケット削除処理をリセット
-	::InterlockedExchange(&m_lResetFilter, 1);
 
 	// ビットレート計算用クラス
 	m_BitRate.Clear();
@@ -1012,9 +1036,6 @@ DWORD WINAPI CBonTuner::COMProcThread(LPVOID lpParameter)
 		} // 1000ms毎処理
 	} // while (!terminate)
 
-	// グラフ関係の解放
-	pSys->_CloseTuner();
-
 	// DSフィルター列挙とチューナ・キャプチャのリストを削除
 	SAFE_DELETE(pSys->m_pDSFilterEnumTuner);
 	SAFE_DELETE(pSys->m_pDSFilterEnumCapture);
@@ -1075,65 +1096,12 @@ DWORD WINAPI CBonTuner::DecodeProcThread(LPVOID lpParameter)
 						// TSMFの処理を行う
 						BYTE * newBuf = NULL;
 						size_t newBufSize = 0;
-						pSys->m_TSMFParser.ParseTsBuffer(pBuff->pbyBuff, pBuff->Size, &newBuf, &newBufSize, pSys->m_bDeleteNullPackets);
+						pSys->m_TSMFParser.ParseTsBuffer(pBuff->pbyBuff, pBuff->Size, &newBuf, &newBufSize);
 						if (newBuf) {
 							TS_DATA * pNewTS = new TS_DATA(newBuf, (DWORD)newBufSize, FALSE);
 							pSys->m_DecodedTsBuff.Add(pNewTS);
 						}
 						SAFE_DELETE(pBuff);
-					}
-					else if (pSys->m_bDeleteNullPackets) {
-						if (::InterlockedExchange(&pSys->m_lResetFilter, 0)) {
-							// リセット
-							pSys->m_PacketSize = 0;
-							pSys->m_FilterBuf.clear();
-						}
-
-						// 基本的に取得データのメモリ領域を利用することでメモリ確保を省略するが
-						// 半端分が蓄積するときだけ領域を拡張して解消する
-						size_t sizeToExtend = pSys->m_FilterBuf.size() >= 188 * 16 ? pBuff->Size + 188 * 16 : 0;
-						pSys->m_FilterBuf.insert(pSys->m_FilterBuf.end(), pBuff->pbyBuff, pBuff->pbyBuff + pBuff->Size);
-						if (sizeToExtend > 0) {
-							// 拡張
-							SAFE_DELETE(pBuff);
-							pBuff = new TS_DATA(new BYTE[sizeToExtend], sizeToExtend, FALSE);
-						}
-
-						size_t rpos = 0;
-						size_t wpos = 0;
-						while (rpos + pSys->m_PacketSize <= pSys->m_FilterBuf.size() && wpos + 188 <= pBuff->Size) {
-							if (pSys->m_PacketSize == 0) {
-								// TSパケットの同期
-								size_t truncate = 0;
-								CTSMFParser::SyncPacket(pSys->m_FilterBuf.data() + rpos, pSys->m_FilterBuf.size() - rpos, &truncate, &pSys->m_PacketSize);
-								rpos += truncate;
-								if (truncate == 0)
-									// TSバッファのデータサイズが小さすぎて同期できない
-									break;
-							}
-							else if (pSys->m_FilterBuf[rpos] != CTSMFParser::TS_PACKET_SYNC_BYTE) {
-								// 同期外れ
-								pSys->m_PacketSize = 0;
-							}
-							else {
-								WORD pid = ((pSys->m_FilterBuf[rpos + 1] << 8) | pSys->m_FilterBuf[rpos + 2]) & 0x1fff;
-								if (pid != 0x1fff) {
-									// ヌルパケットでないので追加
-									memcpy(pBuff->pbyBuff + wpos, pSys->m_FilterBuf.data() + rpos, 188);
-									wpos += 188;
-								}
-								rpos += pSys->m_PacketSize;
-							}
-						}
-
-						pSys->m_FilterBuf.erase(pSys->m_FilterBuf.begin(), pSys->m_FilterBuf.begin() + rpos);
-						if (wpos > 0) {
-							pBuff->Size = wpos;
-							pSys->m_DecodedTsBuff.Add(pBuff);
-						}
-						else {
-							SAFE_DELETE(pBuff);
-						}
 					}
 					else {
 						// TSMFの処理を行わない場合はそのまま追加
@@ -1199,7 +1167,7 @@ void CBonTuner::StopRecv(void)
 
 void CBonTuner::ReadIniFile(void)
 {
-	const std::map<const std::wstring, const int, std::less<>> mapThreadPriority = {
+	static const std::map<const std::wstring, const int, std::less<>> mapThreadPriority = {
 		{ L"",                              THREAD_PRIORITY_ERROR_RETURN },
 		{ L"THREAD_PRIORITY_IDLE",          THREAD_PRIORITY_IDLE },
 		{ L"THREAD_PRIORITY_LOWEST",        THREAD_PRIORITY_LOWEST },
@@ -1210,7 +1178,7 @@ void CBonTuner::ReadIniFile(void)
 		{ L"THREAD_PRIORITY_TIME_CRITICAL", THREAD_PRIORITY_TIME_CRITICAL },
 	};
 
-	const std::map<const std::wstring, const int, std::less<>> mapModulationType = {
+	static const std::map<const std::wstring, const int, std::less<>> mapModulationType = {
 		{ L"BDA_MOD_NOT_SET",          ModulationType::BDA_MOD_NOT_SET },
 		{ L"BDA_MOD_NOT_DEFINED",      ModulationType::BDA_MOD_NOT_DEFINED },
 		{ L"BDA_MOD_16QAM",            ModulationType::BDA_MOD_16QAM },
@@ -1250,7 +1218,7 @@ void CBonTuner::ReadIniFile(void)
 		{ L"BDA_MOD_ISDB_S_TMCC",      ModulationType::BDA_MOD_ISDB_S_TMCC },
 	};
 
-	const std::map<const std::wstring, const int, std::less<>> mapFECMethod = {
+	static const std::map<const std::wstring, const int, std::less<>> mapFECMethod = {
 		{ L"BDA_FEC_METHOD_NOT_SET",     FECMethod::BDA_FEC_METHOD_NOT_SET },
 		{ L"BDA_FEC_METHOD_NOT_DEFINED", FECMethod::BDA_FEC_METHOD_NOT_DEFINED },
 		{ L"BDA_FEC_VITERBI",            FECMethod::BDA_FEC_VITERBI },
@@ -1260,7 +1228,7 @@ void CBonTuner::ReadIniFile(void)
 		{ L"BDA_FEC_RS_147_130",         FECMethod::BDA_FEC_RS_147_130 },
 	};
 
-	const std::map<const std::wstring, const int, std::less<>> mapBinaryConvolutionCodeRate = {
+	static const std::map<const std::wstring, const int, std::less<>> mapBinaryConvolutionCodeRate = {
 		{ L"BDA_BCC_RATE_NOT_SET",     BinaryConvolutionCodeRate::BDA_BCC_RATE_NOT_SET },
 		{ L"BDA_BCC_RATE_NOT_DEFINED", BinaryConvolutionCodeRate::BDA_BCC_RATE_NOT_DEFINED },
 		{ L"BDA_BCC_RATE_1_2",         BinaryConvolutionCodeRate::BDA_BCC_RATE_1_2 },
@@ -1279,7 +1247,7 @@ void CBonTuner::ReadIniFile(void)
 		{ L"BDA_BCC_RATE_9_10",        BinaryConvolutionCodeRate::BDA_BCC_RATE_9_10 },
 	};
 
-	const std::map<const std::wstring, const int, std::less<>> mapTuningSpaceType = {
+	static const std::map<const std::wstring, const int, std::less<>> mapTuningSpaceType = {
 		{ L"DVB-S/DVB-S2",  enumTunerType::eTunerTypeDVBS },
 		{ L"DVB-S2",        enumTunerType::eTunerTypeDVBS },
 		{ L"DVB-S",         enumTunerType::eTunerTypeDVBS },
@@ -1294,7 +1262,7 @@ void CBonTuner::ReadIniFile(void)
 		{ L"DIGITAL CABLE", enumTunerType::eTunerTypeDigitalCable },
 	};
 
-	const std::map<const std::wstring, const int, std::less<>> mapSpecifyTuningSpace = {
+	static const std::map<const std::wstring, const int, std::less<>> mapSpecifyTuningSpace = {
 		{ L"AUTO",                     enumTuningSpace::eTuningSpaceAuto },
 		{ L"DVBTUNINGSPACE",           enumTuningSpace::eTuningSpaceDVB },
 		{ L"DVBSTUNINGSPACE",          enumTuningSpace::eTuningSpaceDVBS },
@@ -1303,7 +1271,7 @@ void CBonTuner::ReadIniFile(void)
 		{ L"DIGITALCABLETUNINGSPACE",  enumTuningSpace::eTuningSpaceDigitalCable },
 	};
 
-	const std::map<const std::wstring, const int, std::less<>> mapSpecifyLocator = {
+	static const std::map<const std::wstring, const int, std::less<>> mapSpecifyLocator = {
 		{ L"AUTO", eLocatorAuto },
 		{ L"DVBTLOCATOR",         enumLocator::eLocatorDVBT },
 		{ L"DVBTLOCATOR2",        enumLocator::eLocatorDVBT2 },
@@ -1314,7 +1282,7 @@ void CBonTuner::ReadIniFile(void)
 		{ L"DIGITALCABLELOCATOR", enumLocator::eLocatorDigitalCable },
 	};
 
-	const std::map<const std::wstring, const int, std::less<>> mapSpecifyITuningSpaceNetworkType = {
+	static const std::map<const std::wstring, const int, std::less<>> mapSpecifyITuningSpaceNetworkType = {
 		{ L"AUTO",                                       enumNetworkType::eNetworkTypeAuto },
 		{ L"STATIC_DVB_TERRESTRIAL_TV_NETWORK_TYPE",     enumNetworkType::eNetworkTypeDVBT },
 		{ L"STATIC_DVB_SATELLITE_TV_NETWORK_TYPE",       enumNetworkType::eNetworkTypeDVBS },
@@ -1329,7 +1297,7 @@ void CBonTuner::ReadIniFile(void)
 		{ L"STATIC_ECHOSTAR_SATELLITE_TV_NETWORK_TYPE",  enumNetworkType::eNetworkTypeEchoStar },
 	};
 
-	const std::map<const std::wstring, const int, std::less<>> mapSpecifyIDVBTuningSpaceSystemType = {
+	static const std::map<const std::wstring, const int, std::less<>> mapSpecifyIDVBTuningSpaceSystemType = {
 		{ L"AUTO",             enumDVBSystemType::eDVBSystemTypeAuto },
 		{ L"DVB_CABLE",        enumDVBSystemType::eDVBSystemTypeDVBC },
 		{ L"DVB_TERRESTRIAL",  enumDVBSystemType::eDVBSystemTypeDVBT },
@@ -1339,13 +1307,13 @@ void CBonTuner::ReadIniFile(void)
 	};
 
 
-	const std::map<const std::wstring, const int, std::less<>> mapSpecifyIAnalogTVTuningSpaceInputType = {
+	static const std::map<const std::wstring, const int, std::less<>> mapSpecifyIAnalogTVTuningSpaceInputType = {
 		{ L"AUTO",              enumTunerInputType::eTunerInputTypeAuto },
 		{ L"TUNERINPUTCABLE",   enumTunerInputType::eTunerInputTypeCable },
 		{ L"TUNERINPUTANTENNA", enumTunerInputType::eTunerInputTypeAntenna },
 	};
 
-	const std::map<const std::wstring, const int, std::less<>> mapNetworkProvider = {
+	static const std::map<const std::wstring, const int, std::less<>> mapNetworkProvider = {
 		{ L"AUTO",                             enumNetworkProvider::eNetworkProviderAuto },
 		{ L"MICROSOFT NETWORK PROVIDER",       enumNetworkProvider::eNetworkProviderGeneric },
 		{ L"MICROSOFT DVB-S NETWORK PROVIDER", enumNetworkProvider::eNetworkProviderDVBS },
@@ -1354,7 +1322,7 @@ void CBonTuner::ReadIniFile(void)
 		{ L"MICROSOFT ATSC NETWORK PROVIDER",  enumNetworkProvider::eNetworkProviderATSC },
 	};
 
-	const std::map<const std::wstring, const int, std::less<>> mapDefaultNetwork = {
+	static const std::map<const std::wstring, const int, std::less<>> mapDefaultNetwork = {
 		{ L"NONE",     enumDefaultNetwork::eDefaultNetworkNone },
 		{ L"SPHD",     enumDefaultNetwork::eDefaultNetworkSPHD },
 		{ L"BS/CS110", enumDefaultNetwork::eDefaultNetworkBSCS },
@@ -1366,33 +1334,28 @@ void CBonTuner::ReadIniFile(void)
 		{ L"DUAL",     enumDefaultNetwork::eDefaultNetworkDual },
 	};
 
-	const std::map<const std::wstring, const int, std::less<>> mapSignalLevelCalcType = {
-		{ L"SSSTRENGTH",      enumSignalLevelCalcType::eSignalLevelCalcTypeSSStrength },
-		{ L"SSQUALITY",       enumSignalLevelCalcType::eSignalLevelCalcTypeSSQuality },
-		{ L"SSMUL",           enumSignalLevelCalcType::eSignalLevelCalcTypeSSMul },
-		{ L"SSADD",           enumSignalLevelCalcType::eSignalLevelCalcTypeSSAdd },
-		{ L"SSFORMULA",       enumSignalLevelCalcType::eSignalLevelCalcTypeSSFormula },
-		{ L"TUNERSTRENGTH",   enumSignalLevelCalcType::eSignalLevelCalcTypeTunerStrength },
-		{ L"TUNERQUALITY",    enumSignalLevelCalcType::eSignalLevelCalcTypeTunerQuality },
-		{ L"TUNERMUL",        enumSignalLevelCalcType::eSignalLevelCalcTypeTunerMul },
-		{ L"TUNERADD",        enumSignalLevelCalcType::eSignalLevelCalcTypeTunerAdd },
-		{ L"TUNERFORMULA",    enumSignalLevelCalcType::eSignalLevelCalcTypeTunerFormula },
-		{ L"DEMODSSSTRENGTH", enumSignalLevelCalcType::eSignalLevelCalcTypeDemodSSStrength },
-		{ L"DEMODSSQUALITY",  enumSignalLevelCalcType::eSignalLevelCalcTypeDemodSSQuality },
-		{ L"DEMODSSMUL",      enumSignalLevelCalcType::eSignalLevelCalcTypeDemodSSMul },
-		{ L"DEMODSSADD",      enumSignalLevelCalcType::eSignalLevelCalcTypeDemodSSAdd },
-		{ L"DEMODSSFORMULA",  enumSignalLevelCalcType::eSignalLevelCalcTypeDemodSSFormula },
-		{ L"BITRATE",         enumSignalLevelCalcType::eSignalLevelCalcTypeBR },
+	static const std::map<const std::wstring, const int, std::less<>> mapSignalLevelCalcType = {
+		{ L"SSSTRENGTH",     0 },
+		{ L"SSQUALITY",      1 },
+		{ L"SSMUL",          2 },
+		{ L"SSADD",          3 },
+		{ L"TUNERSTRENGTH", 10 },
+		{ L"TUNERQUALITY",  11 },
+		{ L"TUNERMUL",      12 },
+		{ L"TUNERADD",      13 },
+		{ L"TBSSTRENGTH",   20 },
+		{ L"TBSQUALITY",    21 },
+		{ L"TBSSNR",        21 },
+		{ L"BITRATE",      100 },
 	};
 
-	const std::map<const std::wstring, const int, std::less<>> mapSignalLockedJudgeType = {
-		{ L"ALWAYS",        enumSignalLockedJudgeType::eSignalLockedJudgeTypeAlways },
-		{ L"SSLOCKED",      enumSignalLockedJudgeType::eSignalLockedJudgeTypeSS },
-		{ L"TUNERSTRENGTH", enumSignalLockedJudgeType::eSignalLockedJudgeTypeTuner },
-		{ L"DEMODSSLOCKED", enumSignalLockedJudgeType::eSignalLockedJudgeTypeDemodSS },
+	static const std::map<const std::wstring, const int, std::less<>> mapSignalLockedJudgeType = {
+		{ L"ALWAYS",        0 },
+		{ L"SSLOCKED",      1 },
+		{ L"TUNERSTRENGTH", 2 },
 	};
 
-	const std::map<const std::wstring, const int, std::less<>> mapDiSEqC = {
+	static const std::map<const std::wstring, const int, std::less<>> mapDiSEqC = {
 		{ L"",       LNB_Source::BDA_LNB_SOURCE_NOT_SET },
 		{ L"PORT-A", LNB_Source::BDA_LNB_SOURCE_A },
 		{ L"PORT-B", LNB_Source::BDA_LNB_SOURCE_B },
@@ -1400,7 +1363,7 @@ void CBonTuner::ReadIniFile(void)
 		{ L"PORT-D", LNB_Source::BDA_LNB_SOURCE_D },
 	};
 
-	const std::map<const std::wstring, const int, std::less<>> mapTSMFMode = {
+	static const std::map<const std::wstring, const int, std::less<>> mapTSMFMode = {
 		{ L"OFF",      0 },
 		{ L"TSID",     1 },
 		{ L"RELATIVE", 2 },
@@ -1510,36 +1473,22 @@ void CBonTuner::ReadIniFile(void)
 	m_nSignalLevelCalcType = (enumSignalLevelCalcType)IniFileAccess.ReadKeyIValueMapSectionData(L"SignalLevelCalcType", enumSignalLevelCalcType::eSignalLevelCalcTypeSSStrength, mapSignalLevelCalcType);
 	if (m_nSignalLevelCalcType >= eSignalLevelCalcTypeSSMin && m_nSignalLevelCalcType <= eSignalLevelCalcTypeSSMax)
 		m_bSignalLevelGetTypeSS = TRUE;
-	else if (m_nSignalLevelCalcType >= eSignalLevelCalcTypeTunerMin && m_nSignalLevelCalcType <= eSignalLevelCalcTypeTunerMax)
+	if (m_nSignalLevelCalcType >= eSignalLevelCalcTypeTunerMin && m_nSignalLevelCalcType <= eSignalLevelCalcTypeTunerMax)
 		m_bSignalLevelGetTypeTuner = TRUE;
-	else if (m_nSignalLevelCalcType >= eSignalLevelCalcTypeDemodSSMin && m_nSignalLevelCalcType <= eSignalLevelCalcTypeDemodSSMax)
-		m_bSignalLevelGetTypeDemodSS = TRUE;
-	else if (m_nSignalLevelCalcType == eSignalLevelCalcTypeBR)
+	if (m_nSignalLevelCalcType >= eSignalLevelCalcTypeTBSMin && m_nSignalLevelCalcType <= eSignalLevelCalcTypeTBSMax)
+		m_bSignalLevelGetTypeTBS = TRUE;
+	if (m_nSignalLevelCalcType == eSignalLevelCalcTypeBR)
 		m_bSignalLevelGetTypeBR = TRUE;
-
-	if (m_nSignalLevelCalcType == eSignalLevelCalcTypeSSStrength || m_nSignalLevelCalcType == eSignalLevelCalcTypeTunerStrength || m_nSignalLevelCalcType == eSignalLevelCalcTypeDemodSSStrength) {
+	if (m_nSignalLevelCalcType == eSignalLevelCalcTypeSSStrength || m_nSignalLevelCalcType == eSignalLevelCalcTypeSSMul || m_nSignalLevelCalcType == eSignalLevelCalcTypeSSAdd ||
+			m_nSignalLevelCalcType == eSignalLevelCalcTypeTunerStrength || m_nSignalLevelCalcType == eSignalLevelCalcTypeTunerMul || m_nSignalLevelCalcType == eSignalLevelCalcTypeTunerAdd)
 		m_bSignalLevelNeedStrength = TRUE;
-		m_sSignalLevelCalcFormula = L"S / SC + SB";
-	}
-	if (m_nSignalLevelCalcType == eSignalLevelCalcTypeSSQuality || m_nSignalLevelCalcType == eSignalLevelCalcTypeTunerQuality || m_nSignalLevelCalcType == eSignalLevelCalcTypeDemodSSQuality) {
+	if (m_nSignalLevelCalcType == eSignalLevelCalcTypeSSQuality || m_nSignalLevelCalcType == eSignalLevelCalcTypeSSMul || m_nSignalLevelCalcType == eSignalLevelCalcTypeSSAdd ||
+			m_nSignalLevelCalcType == eSignalLevelCalcTypeTunerQuality || m_nSignalLevelCalcType == eSignalLevelCalcTypeTunerMul || m_nSignalLevelCalcType == eSignalLevelCalcTypeTunerAdd)
 		m_bSignalLevelNeedQuality = TRUE;
-		m_sSignalLevelCalcFormula = L"Q / QC + QB";
-	}
-	if (m_nSignalLevelCalcType == eSignalLevelCalcTypeSSMul || m_nSignalLevelCalcType == eSignalLevelCalcTypeTunerMul || m_nSignalLevelCalcType == eSignalLevelCalcTypeDemodSSMul) {
-		m_bSignalLevelNeedStrength = TRUE;
-		m_bSignalLevelNeedQuality = TRUE;
-		m_sSignalLevelCalcFormula = L"(S / SC + SB) * (Q / QC + QB)";
-	}
-	if (m_nSignalLevelCalcType == eSignalLevelCalcTypeSSAdd || m_nSignalLevelCalcType == eSignalLevelCalcTypeTunerAdd || m_nSignalLevelCalcType == eSignalLevelCalcTypeDemodSSAdd) {
-		m_bSignalLevelNeedStrength = TRUE;
-		m_bSignalLevelNeedQuality = TRUE;
-		m_sSignalLevelCalcFormula = L"(S / SC + SB) + (Q / QC + QB)";
-	}
-	if (m_nSignalLevelCalcType == eSignalLevelCalcTypeSSFormula || m_nSignalLevelCalcType == eSignalLevelCalcTypeTunerFormula || m_nSignalLevelCalcType == eSignalLevelCalcTypeDemodSSFormula) {
-		m_bSignalLevelNeedStrength = TRUE;
-		m_bSignalLevelNeedQuality = TRUE;
-		m_sSignalLevelCalcFormula = IniFileAccess.ReadKeySSectionData(L"SignalLevelCalcFormula", L"S / SC + SB");
-	}
+	if (m_nSignalLevelCalcType == eSignalLevelCalcTypeSSMul || m_nSignalLevelCalcType == eSignalLevelCalcTypeTunerMul)
+		m_bSignalLevelCalcTypeMul = TRUE;
+	if (m_nSignalLevelCalcType == eSignalLevelCalcTypeSSAdd || m_nSignalLevelCalcType == eSignalLevelCalcTypeTunerAdd)
+		m_bSignalLevelCalcTypeAdd = TRUE;
 
 	// Strength 値補正係数
 	m_fStrengthCoefficient = (double)IniFileAccess.ReadKeyFSectionData(L"StrengthCoefficient", 1.0);
@@ -1557,28 +1506,12 @@ void CBonTuner::ReadIniFile(void)
 	// Quality 値補正バイアス
 	m_fQualityBias = (double)IniFileAccess.ReadKeyFSectionData(L"QualityBias", 0.0);
 
-	// muparser初期化
-	try {
-		m_muParser.DefineVar(_T("S"), &m_fStrength);
-		m_muParser.DefineVar(_T("SC"), &m_fStrengthCoefficient);
-		m_muParser.DefineVar(_T("SB"), &m_fStrengthBias);
-		m_muParser.DefineVar(_T("Q"), &m_fQuality);
-		m_muParser.DefineVar(_T("QC"), &m_fQualityCoefficient);
-		m_muParser.DefineVar(_T("QB"), &m_fQualityBias);
-		m_muParser.SetExpr(common::WStringToTString(m_sSignalLevelCalcFormula));
-	}
-	catch (...) {
-		OutputDebug(L"muParser exception. Wrong formula format?\n");
-	}
-
 	// チューニング状態の判断方法
 	m_nSignalLockedJudgeType = (enumSignalLockedJudgeType)IniFileAccess.ReadKeyIValueMapSectionData(L"SignalLockedJudgeType", enumSignalLockedJudgeType::eSignalLockedJudgeTypeSS, mapSignalLockedJudgeType);
 	if (m_nSignalLockedJudgeType == eSignalLockedJudgeTypeSS)
 		m_bSignalLockedJudgeTypeSS = TRUE;
-	else if (m_nSignalLockedJudgeType == eSignalLockedJudgeTypeTuner)
+	if (m_nSignalLockedJudgeType == eSignalLockedJudgeTypeTuner)
 		m_bSignalLockedJudgeTypeTuner = TRUE;
-	else if (m_nSignalLockedJudgeType == eSignalLockedJudgeTypeDemodSS)
-		m_bSignalLockedJudgeTypeDemodSS = TRUE;
 
 	for (unsigned int i = 0; i < MAX_DVB_SYSTEM_TYPE; i++) {
 		std::wstring key, prefix[2];
@@ -1635,13 +1568,6 @@ void CBonTuner::ReadIniFile(void)
 	// 衛星受信パラメータ/変調方式パラメータのデフォルト値
 	m_nDefaultNetwork = (enumDefaultNetwork)IniFileAccess.ReadKeyIValueMapSectionData(L"DefaultNetwork", enumDefaultNetwork::eDefaultNetworkSPHD, mapDefaultNetwork);
 
-	// フィルタグラフをRunningObjectTableに登録するかどうか
-	m_bRegisterGraphInROT = IniFileAccess.ReadKeyBSectionData(L"RegisterGraphInROT", FALSE);
-
-	// 電源プラン変更のGUID
-	m_sPowerSetOnOpenedGUID = IniFileAccess.ReadKeySSectionData(L"PowerSetOnOpenedGUID", L"");
-	m_sPowerSetOnClosingGUID = IniFileAccess.ReadKeySSectionData(L"PowerSetOnClosingGUID", L"");
-
 	//
 	// BonDriver セクション
 	//
@@ -1650,7 +1576,7 @@ void CBonTuner::ReadIniFile(void)
 
 	// ストリームデータバッファ1個分のサイズ
 	// 188×設定数(bytes)
-	m_nBuffSize = 188 * (size_t)IniFileAccess.ReadKeyISectionData(L"BuffSize", 1024);
+	m_nBuffSize = (size_t)(188 * IniFileAccess.ReadKeyISectionData(L"BuffSize", 1024));
 
 	// ストリームデータバッファの最大個数
 	m_nMaxBuffCount = (size_t)IniFileAccess.ReadKeyISectionData(L"MaxBuffCount", 512);
@@ -1664,9 +1590,6 @@ void CBonTuner::ReadIniFile(void)
 	// WaitTsStream時ストリームデータバッファが貯まっていない場合に最低限待機する時間(msec)
 	// チューナのCPU負荷が高いときは100msec程度を指定すると効果がある場合もある
 	m_nWaitTsSleep = IniFileAccess.ReadKeyISectionData(L"WaitTsSleep", 100);
-
-	// ヌルパケットを削除するかどうか
-	m_bDeleteNullPackets = IniFileAccess.ReadKeyBSectionData(L"DeleteNullPackets", FALSE);
 
 	// SetChannel()でチャンネルロックに失敗した場合でもFALSEを返さないようにするかどうか
 	m_bAlwaysAnswerLocked = IniFileAccess.ReadKeyBSectionData(L"AlwaysAnswerLocked", FALSE);
@@ -1890,9 +1813,9 @@ void CBonTuner::ReadIniFile(void)
 			modulationNumberDVBS2 = modulation;
 			m_sModulationName[modulation] = L"DVB-S2";							// チャンネル名生成用変調方式名称
 			m_aModulationType[modulation].Modulation = BDA_MOD_NBC_8PSK;		// 変調タイプ
-			m_aModulationType[modulation].InnerFEC = BDA_FEC_LDPC;				// 内部前方誤り訂正タイプ
+			m_aModulationType[modulation].InnerFEC = BDA_FEC_VITERBI;			// 内部前方誤り訂正タイプ
 			m_aModulationType[modulation].InnerFECRate = BDA_BCC_RATE_3_5;		// 内部FECレート
-			m_aModulationType[modulation].OuterFEC = BDA_FEC_BCH;				// 外部前方誤り訂正タイプ
+			m_aModulationType[modulation].OuterFEC = BDA_FEC_RS_204_188;		// 外部前方誤り訂正タイプ
 			m_aModulationType[modulation].OuterFECRate = BDA_BCC_RATE_NOT_SET;	// 外部FECレート
 			m_aModulationType[modulation].SymbolRate = 23303;					// シンボルレート
 		}
@@ -2479,7 +2402,7 @@ void CBonTuner::ReadIniFile(void)
 				Generate.NameOffset = 1UL;
 				Generate.NameStep = 2UL;
 				Generate.NameOffsetTS = 0UL;
-				relativeTS = 4UL;
+				relativeTS = 3UL;
 			}
 			else if (genSpace == L"ND2") {
 				Generate.Space = eChGenerateND2;
@@ -2960,100 +2883,6 @@ void CBonTuner::ReadIniFile(void)
 	}
 }
 
-void CBonTuner::PowerSetOnOpened(void)
-{
-	if (m_sPowerSetOnOpenedGUID.empty())
-		return;
-
-	// Null DACLのセキュリティ記述子 (TODO: Null DACLでなく必要なアクセス範囲に限るのが望ましい)
-	SECURITY_DESCRIPTOR sdNull = {};
-	if (!::InitializeSecurityDescriptor(&sdNull, SECURITY_DESCRIPTOR_REVISION) ||
-			!::SetSecurityDescriptorDacl(&sdNull, TRUE, NULL, FALSE)) {
-		OutputDebug(L"Security descriptor creation failed.\n");
-		return;
-	}
-	SECURITY_ATTRIBUTES saNull = {};
-	saNull.nLength = sizeof(saNull);
-	saNull.lpSecurityDescriptor = &sdNull;
-
-	// このAPIはVista以降
-	DWORD (WINAPI *funcPowerSetActiveScheme)(HKEY, const GUID *) = NULL;
-	HMODULE hModule = ::LoadLibraryW(L"powrprof.dll");
-	if (hModule)
-		funcPowerSetActiveScheme = (DWORD (WINAPI *)(HKEY, const GUID *))::GetProcAddress(hModule, "PowerSetActiveScheme");
-
-	if (!funcPowerSetActiveScheme) {
-		OutputDebug(L"PowerSetActiveScheme API not found.\n");
-		if (hModule)
-			::FreeLibrary(hModule);
-		return;
-	}
-
-	m_hPowerSetLock = ::CreateMutexW(&saNull, FALSE, POWER_SET_LOCK_NAME);
-	if (m_hPowerSetLock && ::WaitForSingleObject(m_hPowerSetLock, POWER_SET_WAIT_MSEC) == WAIT_OBJECT_0) {
-		BOOL bRet = FALSE;
-		// このオブジェクトは最後に閉じたかどうか知るための単なるフラグ
-		m_hPowerSetFlag = ::CreateMutexW(&saNull, FALSE, POWER_SET_FLAG_NAME);
-		if (m_hPowerSetFlag) {
-			// オブジェクトを生成したか既に生成済み
-			GUID guid;
-			bRet = ::UuidFromStringW((RPC_WSTR)m_sPowerSetOnOpenedGUID.c_str(), &guid) == RPC_S_OK &&
-				funcPowerSetActiveScheme(NULL, &guid) == 0;
-		}
-		::ReleaseMutex(m_hPowerSetLock);
-		OutputDebug(L"PowerSetActiveScheme(%s) %s.\n", m_sPowerSetOnOpenedGUID.c_str(), bRet ? L"success" : L"failed");
-	}
-	else {
-		OutputDebug(L"Cannot acquire %s.\n", POWER_SET_LOCK_NAME);
-	}
-
-	::FreeLibrary(hModule);
-}
-
-void CBonTuner::PowerSetOnClosing(void)
-{
-	if (!m_hPowerSetLock)
-		return;
-
-	// このAPIはVista以降
-	DWORD (WINAPI *funcPowerSetActiveScheme)(HKEY, const GUID *) = NULL;
-	HMODULE hModule = ::LoadLibraryW(L"powrprof.dll");
-	if (hModule)
-		funcPowerSetActiveScheme = (DWORD (WINAPI *)(HKEY, const GUID *))::GetProcAddress(hModule, "PowerSetActiveScheme");
-
-	if (m_hPowerSetFlag) {
-		if (::WaitForSingleObject(m_hPowerSetLock, POWER_SET_WAIT_MSEC) == WAIT_OBJECT_0) {
-			BOOL bRet = FALSE;
-			BOOL bLog = FALSE;
-			SAFE_CLOSE_HANDLE(m_hPowerSetFlag);
-			m_hPowerSetFlag = ::OpenMutexW(SYNCHRONIZE, FALSE, POWER_SET_FLAG_NAME);
-			if (!m_hPowerSetFlag) {
-				// オブジェクトを破棄した
-				if (!m_sPowerSetOnClosingGUID.empty()) {
-					GUID guid;
-					bRet = ::UuidFromStringW((RPC_WSTR)m_sPowerSetOnClosingGUID.c_str(), &guid) == RPC_S_OK &&
-						funcPowerSetActiveScheme &&
-						funcPowerSetActiveScheme(NULL, &guid) == 0;
-					bLog = TRUE;
-				}
-			}
-			SAFE_CLOSE_HANDLE(m_hPowerSetFlag);
-			::ReleaseMutex(m_hPowerSetLock);
-			if (bLog)
-				OutputDebug(L"PowerSetActiveScheme(%s) %s.\n", m_sPowerSetOnClosingGUID.c_str(), bRet ? L"success" : L"failed");
-		}
-		else {
-			OutputDebug(L"Cannot acquire %s.\n", POWER_SET_LOCK_NAME);
-			SAFE_CLOSE_HANDLE(m_hPowerSetFlag);
-		}
-	}
-
-	if (hModule)
-		::FreeLibrary(hModule);
-
-	SAFE_CLOSE_HANDLE(m_hPowerSetLock);
-}
-
 void CBonTuner::GetSignalState(int* pnStrength, int* pnQuality, int* pnLock)
 {
 	if (pnStrength) *pnStrength = 0;
@@ -3091,46 +2920,24 @@ void CBonTuner::GetSignalState(int* pnStrength, int* pnQuality, int* pnLock)
 		}
 	}
 
-	if (m_pIBDA_SignalStatisticsTunerNode) {
+	if (m_pIBDA_SignalStatistics) {
 		if (m_bSignalLevelGetTypeSS) {
 			if (m_bSignalLevelNeedStrength && pnStrength) {
 				longVal = 0;
-				if (SUCCEEDED(hr = m_pIBDA_SignalStatisticsTunerNode->get_SignalStrength(&longVal)))
+				if (SUCCEEDED(hr = m_pIBDA_SignalStatistics->get_SignalStrength(&longVal)))
 					*pnStrength = (int)(longVal & 0xffff);
 			}
 
 			if (m_bSignalLevelNeedQuality && pnQuality) {
 				longVal = 0;
-				if (SUCCEEDED(hr = m_pIBDA_SignalStatisticsTunerNode->get_SignalQuality(&longVal)))
+				if (SUCCEEDED(hr = m_pIBDA_SignalStatistics->get_SignalQuality(&longVal)))
 					*pnQuality = (int)(min(max(longVal & 0xffff, 0), 100));
 			}
 		}
 
 		if (m_bSignalLockedJudgeTypeSS && pnLock) {
 			byteVal = 0;
-			if (SUCCEEDED(hr = m_pIBDA_SignalStatisticsTunerNode->get_SignalLocked(&byteVal)))
-				*pnLock = (int)byteVal;
-		}
-	}
-
-	if (m_pIBDA_SignalStatisticsDemodNode) {
-		if (m_bSignalLevelGetTypeDemodSS) {
-			if (m_bSignalLevelNeedStrength && pnStrength) {
-				longVal = 0;
-				if (SUCCEEDED(hr = m_pIBDA_SignalStatisticsDemodNode->get_SignalStrength(&longVal)))
-					*pnStrength = (int)(longVal & 0xffff);
-			}
-
-			if (m_bSignalLevelNeedQuality && pnQuality) {
-				longVal = 0;
-				if (SUCCEEDED(hr = m_pIBDA_SignalStatisticsDemodNode->get_SignalQuality(&longVal)))
-					*pnQuality = (int)(min(max(longVal & 0xffff, 0), 100));
-			}
-		}
-
-		if (m_bSignalLockedJudgeTypeDemodSS && pnLock) {
-			byteVal = 0;
-			if (SUCCEEDED(hr = m_pIBDA_SignalStatisticsDemodNode->get_SignalLocked(&byteVal)))
+			if (SUCCEEDED(hr = m_pIBDA_SignalStatistics->get_SignalLocked(&byteVal)))
 				*pnLock = (int)byteVal;
 		}
 	}
@@ -3417,9 +3224,6 @@ BOOL CBonTuner::LockChannel(const TuningParam *pTuningParam, BOOL bLockTwice)
 	}
 
 	if (m_pIBdaSpecials2) {
-		// チューナ固有のTSID関数があれば呼び出す
-		hr = m_pIBdaSpecials2->SetTSid(pTuningParam->TSID);
-
 		// m_pIBdaSpecialsでput_TuneRequestの前に何らかの処理が必要なら行う
 		hr = m_pIBdaSpecials2->PreTuneRequest(pTuningParam, pITuneRequest);
 	}
@@ -3567,32 +3371,26 @@ HRESULT CBonTuner::CheckCapture(std::wstring tunerGUID, std::wstring tunerFriend
 }
 
 // チューナ固有関数のロード
-void CBonTuner::LoadTunerDependCode(std::wstring tunerGUID, std::wstring tunerFriendlyName, std::wstring captureGUID, std::wstring captureFriendlyName)
+void CBonTuner::LoadTunerDependCode(void)
 {
 	if (!m_hModuleTunerSpecials)
 		return;
 
 	IBdaSpecials* (*func)(CComPtr<IBaseFilter>);
 	func = (IBdaSpecials* (*)(CComPtr<IBaseFilter>))::GetProcAddress(m_hModuleTunerSpecials, "CreateBdaSpecials");
-	IBdaSpecials* (*func2)(CComPtr<IBaseFilter>, CComPtr<IBaseFilter>, const WCHAR*, const WCHAR*, const WCHAR*, const WCHAR*);
-	func2 = (IBdaSpecials * (*)(CComPtr<IBaseFilter>, CComPtr<IBaseFilter>, const WCHAR*, const WCHAR*, const WCHAR*, const WCHAR*))::GetProcAddress(m_hModuleTunerSpecials, "CreateBdaSpecials2");
-	if (!func2 && !func) {
+	if (!func) {
 		OutputDebug(L"LoadTunerDependCode: Cannot find CreateBdaSpecials.\n");
 		::FreeLibrary(m_hModuleTunerSpecials);
 		m_hModuleTunerSpecials = NULL;
 		return;
 	}
-	if (func2)
-	{
-		OutputDebug(L"LoadTunerDependCode: CreateBdaSpecials2 found.\n");
-		m_pIBdaSpecials = func2(m_pTunerDevice, m_pCaptureDevice, tunerGUID.c_str(), tunerFriendlyName.c_str(), captureGUID.c_str(), captureFriendlyName.c_str());
-	}
 	else {
 		OutputDebug(L"LoadTunerDependCode: CreateBdaSpecials found.\n");
-		m_pIBdaSpecials = func(m_pTunerDevice);
 	}
 
-	m_pIBdaSpecials2 = dynamic_cast<IBdaSpecials2b5 *>(m_pIBdaSpecials);
+	m_pIBdaSpecials = func(m_pTunerDevice);
+
+	m_pIBdaSpecials2 = dynamic_cast<IBdaSpecials2b2 *>(m_pIBdaSpecials);
 	if (!m_pIBdaSpecials2)
 		OutputDebug(L"LoadTunerDependCode: Not IBdaSpecials2 Interface DLL.\n");
 
@@ -3659,24 +3457,6 @@ HRESULT CBonTuner::InitializeGraphBuilder(void)
 			hr = E_FAIL;
 		}
 		else {
-			if (m_bRegisterGraphInROT) {
-				std::wstring name = common::WStringPrintf(L"FilterGraph %p pid %08x", pIGraphBuilder.p, ::GetCurrentProcessId());
-				IRunningObjectTable * pROT;
-				if (SUCCEEDED(::GetRunningObjectTable(0, &pROT))) {
-					IMoniker * pMoniker;
-					if (SUCCEEDED(::CreateItemMoniker(L"!", name.c_str(), &pMoniker))) {
-						if (FAILED(pROT->Register(ROTFLAGS_REGISTRATIONKEEPSALIVE, pIGraphBuilder, pMoniker, &m_dwROTRegister)))
-							m_dwROTRegister = 0;
-						pMoniker->Release();
-					}
-					pROT->Release();
-				}
-				if (m_dwROTRegister == 0)
-					OutputDebug(L"ROT registration failed.\n");
-				else
-					OutputDebug(L"ROT registration success. entry=%u (%s).\n", m_dwROTRegister, name.c_str());
-			}
-
 			// 成功なのでこのまま終了
 			m_pIGraphBuilder = pIGraphBuilder;
 			m_pIMediaControl = pIMediaControl;
@@ -3709,15 +3489,6 @@ void CBonTuner::CleanupGraph(void)
 	UnloadNetworkProvider();
 	UnloadTuningSpace();
 
-	if (m_dwROTRegister != 0) {
-		IRunningObjectTable * pROT;
-		if (SUCCEEDED(::GetRunningObjectTable(0, &pROT))) {
-			pROT->Revoke(m_dwROTRegister);
-			pROT->Release();
-		}
-		m_dwROTRegister = 0;
-	}
-
 	m_pIMediaControl.Release();
 	m_pIGraphBuilder.Release();
 
@@ -3746,19 +3517,6 @@ void CBonTuner::StopGraph(void)
 	if (m_pIMediaControl) {
 		SAFE_CLOSE_HANDLE(m_hStreamThread);
 		m_bIsSetStreamThread = FALSE;
-
-		// a workaround for WinXP SP3
-		// CBonTuner::LoadAndConnectDevice() にて動作するチューナが一つもなかったとき、
-		// m_pIMediaControl->Stop() の内部で MsDvbNp.ax が access violation を起こす。
-		// なので、Stop する必要のないときは何もしないようにする
-		OAFilterState fs;
-		if (FAILED(hr = m_pIMediaControl->GetState(100, &fs))) {
-			OutputDebug(L"IMediaControl::GetState failed.\n");
-		}
-		else {
-			if (fs == State_Stopped)
-				return;
-		}
 
 		if (FAILED(hr = m_pIMediaControl->Pause())) {
 			OutputDebug(L"IMediaControl::Pause failed.\n");
@@ -4510,7 +4268,14 @@ HRESULT CBonTuner::InitDSFilterEnum(void)
 	SAFE_DELETE(m_pDSFilterEnumTuner);
 	SAFE_DELETE(m_pDSFilterEnumCapture);
 
-	m_pDSFilterEnumTuner = new CDSFilterEnum(KSCATEGORY_BDA_NETWORK_TUNER, CDEF_DEVMON_PNP_DEVICE);
+	try {
+		m_pDSFilterEnumTuner = new CDSFilterEnum(KSCATEGORY_BDA_NETWORK_TUNER, CDEF_DEVMON_PNP_DEVICE);
+	}
+	catch (...) {
+		OutputDebug(L"[InitDSFilterEnum] Fail to construct CDSFilterEnum(KSCATEGORY_BDA_NETWORK_TUNER).\n");
+		return E_FAIL;
+	}
+
 	order = 0;
 	while (SUCCEEDED(hr = m_pDSFilterEnumTuner->next()) && hr == S_OK) {
 		std::wstring sDisplayName;
@@ -4526,20 +4291,28 @@ HRESULT CBonTuner::InitDSFilterEnum(void)
 		order++;
 	}
 
-	m_pDSFilterEnumCapture = new CDSFilterEnum(KSCATEGORY_BDA_RECEIVER_COMPONENT, CDEF_DEVMON_PNP_DEVICE);
-	order = 0;
-	while (SUCCEEDED(hr = m_pDSFilterEnumCapture->next()) && hr == S_OK) {
-		std::wstring sDisplayName;
-		std::wstring sFriendlyName;
+	try {
+		m_pDSFilterEnumCapture = new CDSFilterEnum(KSCATEGORY_BDA_RECEIVER_COMPONENT, CDEF_DEVMON_PNP_DEVICE);
+	}
+	catch (...) {
+		OutputDebug(L"[InitDSFilterEnum] Fail to construct CDSFilterEnum(KSCATEGORY_BDA_RECEIVER_COMPONENT). Continue processing...\n");
+	}
 
-		// チューナの DisplayName, FriendlyName を得る
-		m_pDSFilterEnumCapture->getDisplayName(&sDisplayName);
-		m_pDSFilterEnumCapture->getFriendlyName(&sFriendlyName);
+	if (m_pDSFilterEnumCapture) {
+		order = 0;
+		while (SUCCEEDED(hr = m_pDSFilterEnumCapture->next()) && hr == S_OK) {
+			std::wstring sDisplayName;
+			std::wstring sFriendlyName;
 
-		// 一覧に追加
-		CaptureList.emplace_back(sDisplayName, sFriendlyName, order);
+			// チューナの DisplayName, FriendlyName を得る
+			m_pDSFilterEnumCapture->getDisplayName(&sDisplayName);
+			m_pDSFilterEnumCapture->getFriendlyName(&sFriendlyName);
 
-		order++;
+			// 一覧に追加
+			CaptureList.emplace_back(sDisplayName, sFriendlyName, order);
+
+			order++;
+		}
 	}
 
 	unsigned int total = 0;
@@ -4742,7 +4515,7 @@ HRESULT CBonTuner::LoadAndConnectDevice(void)
 														m_pTunerDevice = pTunerDevice;
 														m_pCaptureDevice = pCaptureDevice;
 														// チューナ固有関数のロード
-														LoadTunerDependCode(it->Tuner.GUID, it->Tuner.FriendlyName, it2->GUID, it2->FriendlyName);
+														LoadTunerDependCode();
 														if (m_bTryAnotherTuner)
 															// 今回の組合せをチューナ・キャプチャリストの最後尾に移動
 															m_UsableTunerCaptureList.splice(m_UsableTunerCaptureList.end(), m_UsableTunerCaptureList, it);
@@ -4768,7 +4541,7 @@ HRESULT CBonTuner::LoadAndConnectDevice(void)
 									// すべて成功
 									m_pTunerDevice = pTunerDevice;
 									// チューナ固有関数のロード
-									LoadTunerDependCode(it->Tuner.GUID, it->Tuner.FriendlyName, L"", L"");
+									LoadTunerDependCode();
 									if (m_bTryAnotherTuner)
 										// 今回の組合せをチューナ・キャプチャリストの最後尾に移動
 										m_UsableTunerCaptureList.splice(m_UsableTunerCaptureList.end(), m_UsableTunerCaptureList, it);
@@ -5038,67 +4811,190 @@ void CBonTuner::UnloadTif(void)
 	m_pTif.Release();
 }
 
-HRESULT CBonTuner::LoadTunerSignalStatisticsTunerNode(void)
+HRESULT CBonTuner::LoadTunerSignalStatistics(void)
 {
 	HRESULT hr = E_FAIL;
 
 	if (!m_pTunerDevice) {
-		OutputDebug(L"[LoadTunerSignalStatisticsTunerNode] TunerDevice NOT SET.\n");
+		OutputDebug(L"[LoadTunerSignalStatistics] TunerDevice NOT SET.\n");
 		return E_POINTER;
 	}
 
-	CDSEnumNodes DSEnumNodes(m_pTunerDevice);
-	CComPtr<IUnknown> pControlNode;
-	if (FAILED(hr = DSEnumNodes.getControlNode(__uuidof(IBDA_FrequencyFilter), &pControlNode))) {
-		OutputDebug(L"[LoadTunerSignalStatisticsTunerNode] Fail to get control node.\n");
-		return E_FAIL;
+	CComQIPtr<IBDA_Topology> pIBDA_Topology(m_pTunerDevice);
+	if (!pIBDA_Topology) {
+		OutputDebug(L"[LoadTunerSignalStatistics] Fail to get IBDA_Topology interface.\n");
+		hr = E_FAIL;
+	}
+	else {
+		ULONG NodeTypes;
+		ULONG NodeType[32];
+		if (FAILED(hr = pIBDA_Topology->GetNodeTypes(&NodeTypes, 32, NodeType))) {
+			OutputDebug(L"[LoadTunerSignalStatistics] Fail to get NodeTypes.\n");
+		}
+		else {
+			for (ULONG i = 0; i < NodeTypes; i++) {
+				CComPtr<IUnknown> pControlNode;
+				if (SUCCEEDED(hr = pIBDA_Topology->GetControlNode(0UL, 1UL, NodeType[i], &pControlNode))) {
+					CComQIPtr<IBDA_SignalStatistics> pIBDA_SignalStatistics(pControlNode);
+					if (pIBDA_SignalStatistics) {
+						OutputDebug(L"[LoadTunerSignalStatistics] SUCCESS.\n");
+						m_pIBDA_SignalStatistics = pIBDA_SignalStatistics;
+						return hr;
+					}
+				}
+			}
+		}
 	}
 
-	CComQIPtr<IBDA_SignalStatistics> pIBDA_SignalStatistics(pControlNode);
-	if (!pIBDA_SignalStatistics) {
-		OutputDebug(L"[LoadTunerSignalStatisticsTunerNode] Fail to get IBDA_SignalStatistics interface.\n");
-		return E_FAIL;
-	}
-
-	OutputDebug(L"[LoadTunerSignalStatisticsTunerNode] SUCCESS.\n");
-	m_pIBDA_SignalStatisticsTunerNode = pIBDA_SignalStatistics;
-
-	return S_OK;
-}
-
-HRESULT CBonTuner::LoadTunerSignalStatisticsDemodNode(void)
-{
-	HRESULT hr = E_FAIL;
-
-	if (!m_pTunerDevice) {
-		OutputDebug(L"[LoadTunerSignalStatisticsDemodNode] TunerDevice NOT SET.\n");
-		return E_POINTER;
-	}
-
-	CDSEnumNodes DSEnumNodes(m_pTunerDevice);
-	CComPtr<IUnknown> pControlNode;
-	if (FAILED(hr = DSEnumNodes.getControlNode(__uuidof(IBDA_DigitalDemodulator), &pControlNode))) {
-		OutputDebug(L"[LoadTunerSignalStatisticsDemodNode] Fail to get control node.\n");
-		return E_FAIL;
-	}
-
-	CComQIPtr<IBDA_SignalStatistics> pIBDA_SignalStatistics(pControlNode);
-	if (!pIBDA_SignalStatistics) {
-		OutputDebug(L"[LoadTunerSignalStatisticsDemodNode] Fail to get IBDA_SignalStatistics interface.\n");
-		return E_FAIL;
-	}
-
-	OutputDebug(L"[LoadTunerSignalStatisticsDemodNode] SUCCESS.\n");
-	m_pIBDA_SignalStatisticsDemodNode = pIBDA_SignalStatistics;
-
-	return S_OK;
+	OutputDebug(L"[LoadTunerSignalStatistics] Fail to get IBDA_SignalStatistics interface.\n");
+	return E_FAIL;
 }
 
 void CBonTuner::UnloadTunerSignalStatistics(void)
 {
-	m_pIBDA_SignalStatisticsTunerNode.Release();
-	m_pIBDA_SignalStatisticsDemodNode.Release();
+	m_pIBDA_SignalStatistics.Release();
 }
+
+HRESULT CBonTuner::LoadTunerTBSSignalStatus(void)
+{
+	m_pIKsPropertySetTBS.Release();
+	m_bTBSSignalStatusWithInstanceData = FALSE;
+	m_nTBSSignalStatusLastResult = -1;
+
+	if (!m_pTunerDevice) {
+		OutputDebug(L"[LoadTunerTBSSignalStatus] TunerDevice NOT SET.\n");
+		return E_POINTER;
+	}
+
+	// KSPROPERTY_BDA_SIGNAL_STATUS の Get をサポートしていると答えた最初の候補
+	CComPtr<IKsPropertySet> pIKsPropertySetFirst;
+	const WCHAR *szFirst = L"";
+
+	// 候補のインターフェースを確認し、実際に値を取得できればそれを使用する
+	auto TryCandidate = [&](IKsPropertySet *pIKsPropertySet, const WCHAR *szName) -> BOOL {
+		if (!pIKsPropertySet)
+			return FALSE;
+		DWORD dwTypeSupport = 0;
+		if (pIKsPropertySet->QuerySupported(TBS_KSPROPSETID_BdaTunerExtensionProperties, TBS_KSPROPERTY_BDA_SIGNAL_STATUS, &dwTypeSupport) != S_OK ||
+				!(dwTypeSupport & KSPROPERTY_SUPPORT_GET))
+			return FALSE;
+		if (!pIKsPropertySetFirst) {
+			pIKsPropertySetFirst = pIKsPropertySet;
+			szFirst = szName;
+		}
+		BOOL bWithInstanceData = FALSE;
+		TBSSignalStatus status;
+		DWORD dwReturned;
+		if (FAILED(GetTBSSignalStatusSub(pIKsPropertySet, &bWithInstanceData, &status, &dwReturned)))
+			return FALSE;
+		OutputDebug(L"[LoadTunerTBSSignalStatus] SUCCESS (%s).\n", szName);
+		m_pIKsPropertySetTBS = pIKsPropertySet;
+		m_bTBSSignalStatusWithInstanceData = bWithInstanceData;
+		return TRUE;
+	};
+
+	// TBS拡張プロパティは通常チューナデバイスのピンに対して発行するので、
+	// 入力ピン → 出力ピン → フィルタ自身の順に KSPROPERTY_BDA_SIGNAL_STATUS を取得できるものを探す
+	CComPtr<IEnumPins> pIEnumPins;
+	if (SUCCEEDED(m_pTunerDevice->EnumPins(&pIEnumPins))) {
+		static const PIN_DIRECTION aPinDir[] = { PINDIR_INPUT, PINDIR_OUTPUT };
+		for (auto pinDirTarget : aPinDir) {
+			pIEnumPins->Reset();
+			while (1) {
+				CComPtr<IPin> pIPin;
+				if (pIEnumPins->Next(1, &pIPin, NULL) != S_OK) {
+					// ループ終わり
+					break;
+				}
+				PIN_DIRECTION pinDir;
+				if (FAILED(pIPin->QueryDirection(&pinDir)) || pinDir != pinDirTarget)
+					continue;
+				CComQIPtr<IKsPropertySet> pIKsPropertySet(pIPin);
+				if (TryCandidate(pIKsPropertySet, (pinDir == PINDIR_INPUT) ? L"Input pin" : L"Output pin"))
+					return S_OK;
+			}
+		}
+	}
+
+	CComQIPtr<IKsPropertySet> pIKsPropertySet(m_pTunerDevice);
+	if (TryCandidate(pIKsPropertySet, L"Filter"))
+		return S_OK;
+
+	if (pIKsPropertySetFirst) {
+		// サポートしていると答えたが現時点では値を取得できなかった → 最初の候補を使用して後で再試行する
+		OutputDebug(L"[LoadTunerTBSSignalStatus] SUCCESS (%s, but the first Get failed).\n", szFirst);
+		m_pIKsPropertySetTBS = pIKsPropertySetFirst;
+		return S_OK;
+	}
+
+	OutputDebug(L"[LoadTunerTBSSignalStatus] KSPROPERTY_BDA_SIGNAL_STATUS is not supported.\n");
+	return E_NOINTERFACE;
+}
+
+void CBonTuner::UnloadTunerTBSSignalStatus(void)
+{
+	m_pIKsPropertySetTBS.Release();
+}
+
+HRESULT CBonTuner::GetTBSSignalStatus(TBSSignalStatus *pStatus)
+{
+	if (!pStatus)
+		return E_POINTER;
+
+	if (!m_pIKsPropertySetTBS)
+		return E_NOINTERFACE;
+
+	TBSSignalStatus status;
+	DWORD dwReturned = 0;
+	HRESULT hr = GetTBSSignalStatusSub(m_pIKsPropertySetTBS, &m_bTBSSignalStatusWithInstanceData, &status, &dwReturned);
+
+	// デバッグログは取得結果(成功/失敗)が変化した時だけ出力する
+	if (SUCCEEDED(hr)) {
+		if (m_nTBSSignalStatusLastResult != 1) {
+			OutputDebug(L"[GetTBSSignalStatus] SUCCESS (InstanceData=%s): Strength=%ld(0x%08lx) SNR=%ld BER=%ld\n",
+				m_bTBSSignalStatusWithInstanceData ? L"YES" : L"NO", status.lStrength, (ULONG)status.lStrength, status.lSNR, status.lBER);
+			m_nTBSSignalStatusLastResult = 1;
+		}
+		*pStatus = status;
+	}
+	else {
+		if (m_nTBSSignalStatusLastResult != 0) {
+			OutputDebug(L"[GetTBSSignalStatus] FAIL (hr=0x%08lx, returned=%lu bytes).\n", (ULONG)hr, (ULONG)dwReturned);
+			m_nTBSSignalStatusLastResult = 0;
+		}
+	}
+
+	return hr;
+}
+
+HRESULT CBonTuner::GetTBSSignalStatusSub(IKsPropertySet *pIKsPropertySet, BOOL *pbWithInstanceData, TBSSignalStatus *pStatus, DWORD *pdwReturned)
+{
+	HRESULT hr = E_FAIL;
+	DWORD dwReturned = 0;
+
+	// ドライバによって instance data の要否が異なる場合を考慮して、
+	// *pbWithInstanceData で指定された方式 → もう一方の方式の順に試す
+	for (int i = 0; i < 2; i++) {
+		BOOL bWithInstanceData = (i == 0) ? *pbWithInstanceData : !*pbWithInstanceData;
+		TBSSignalStatus instance = {};
+		TBSSignalStatus status = {};
+		dwReturned = 0;
+		hr = pIKsPropertySet->Get(TBS_KSPROPSETID_BdaTunerExtensionProperties, TBS_KSPROPERTY_BDA_SIGNAL_STATUS,
+			bWithInstanceData ? &instance : NULL, bWithInstanceData ? (DWORD)sizeof(instance) : 0UL,
+			&status, (DWORD)sizeof(status), &dwReturned);
+		if (SUCCEEDED(hr) && dwReturned >= sizeof(status)) {
+			// 成功した方式を返す
+			*pbWithInstanceData = bWithInstanceData;
+			*pStatus = status;
+			*pdwReturned = dwReturned;
+			return S_OK;
+		}
+	}
+
+	*pdwReturned = dwReturned;
+	return FAILED(hr) ? hr : E_FAIL;
+}
+
 
 // Connect pins (Common subroutine)
 //  全てのピンを接続して成功したら終了
@@ -5107,34 +5003,68 @@ HRESULT CBonTuner::Connect(IBaseFilter* pFilterUp, IBaseFilter* pFilterDown)
 {
 	HRESULT hr;
 
-	CDSEnumPins DSEnumPinsUp(pFilterUp);
-	CDSEnumPins DSEnumPinsDown(pFilterDown);
+	CComPtr<IEnumPins> pIEnumPinsUp;
+	CComPtr<IEnumPins> pIEnumPinsDown;
 
-	// 上流フィルタのOutputピンの数だけループ
+	// 上流フィルタのピン列挙
+	if (FAILED(hr = pFilterUp->EnumPins(&pIEnumPinsUp))) {
+		OutputDebug(L"  Can not enumerate upstream filter's pins.\n");
+		return hr;
+	}
+
+	// 下流フィルタのピン列挙
+	if (FAILED(hr = pFilterDown->EnumPins(&pIEnumPinsDown))) {
+		OutputDebug(L"  Can not enumerate downstream filter's pins.\n");
+		return hr;
+	}
+
+	// 上流フィルタのピンの数だけループ
 	while (1) {
 		CComPtr<IPin> pIPinUp;
-		if (S_OK != (hr = DSEnumPinsUp.getNextPin(&pIPinUp, PIN_DIRECTION::PINDIR_OUTPUT))) {
+		if (FAILED(hr = pIEnumPinsUp->Next(1, &pIPinUp, 0)) || hr != S_OK) {
 			// ループ終わり
 			break;
 		}
 		do {
+			PIN_DIRECTION pinDirUp;
 			CComPtr<IPin> pIPinPeerOfUp;
+			if (FAILED(hr = pIPinUp->QueryDirection(&pinDirUp))) {
+				OutputDebug(L"  Can not get upstream filter's pinDir.\n");
+				return hr;
+			}
+
+			// 着目ピンが INPUTピンなら次の上流ピンへ
+			if (pinDirUp == PINDIR_INPUT) {
+				break;
+			}
+
 			// 上流フィルタの着目ピンが接続済orエラーだったら次の上流ピンへ
 			if (pIPinUp->ConnectedTo(&pIPinPeerOfUp) != VFW_E_NOT_CONNECTED){
 				OutputDebug(L"  An already connected pin was found.\n");
 				break;
 			}
 
-			// 下流フィルタのInputピンの数だけループ
-			DSEnumPinsDown.Reset();
+			// 下流フィルタのピンの数だけループ
+			pIEnumPinsDown->Reset();
 			while (1) {
 				CComPtr<IPin> pIPinDown;
-				if (S_OK != (hr = DSEnumPinsDown.getNextPin(&pIPinDown, PIN_DIRECTION::PINDIR_INPUT))) {
+				if (FAILED(hr = pIEnumPinsDown->Next(1, &pIPinDown, 0)) || hr != S_OK) {
 					// ループ終わり
 					break;
 				}
 				do {
+					PIN_DIRECTION pinDirDown;
 					CComPtr<IPin> pIPinPeerOfDown;
+					if (FAILED(hr = pIPinDown->QueryDirection(&pinDirDown))) {
+						OutputDebug(L"  Can not get downstream filter's pinDir.\n");
+						return hr;
+					}
+
+					// 着目ピンが OUTPUT ピンなら次の下流ピンへ
+					if (pinDirDown == PINDIR_OUTPUT) {
+						break;
+					}
+
 					// 下流フィルタの着目ピンが接続済orエラーだったら次の下流ピンへ
 					if (pIPinDown->ConnectedTo(&pIPinPeerOfDown) != VFW_E_NOT_CONNECTED) {
 						OutputDebug(L"  An already connected pin was found.\n");
@@ -5167,19 +5097,23 @@ void CBonTuner::DisconnectAll(IBaseFilter* pFilter)
 	
 	HRESULT hr;
 
-	CDSEnumPins DSEnumPins(pFilter);
-	// ピンの数だけループ
-	while (1) {
-		CComPtr<IPin> pIPin;
-		CComPtr<IPin> pIPinPeerOf;
-		if (S_OK != (hr = DSEnumPins.getNextPin(&pIPin))) {
-			// ループ終わり
-			break;
-		}
-		// ピンが接続済だったら切断
-		if (SUCCEEDED(hr = pIPin->ConnectedTo(&pIPinPeerOf))) {
-			hr = m_pIGraphBuilder->Disconnect(pIPinPeerOf);
-			hr = m_pIGraphBuilder->Disconnect(pIPin);
+	CComPtr<IEnumPins> pIEnumPins;
+	// フィルタのピン列挙
+	if (SUCCEEDED(hr = pFilter->EnumPins(&pIEnumPins))) {
+		// ピンの数だけループ
+		while (1) {
+			CComPtr<IPin> pIPin;
+			CComPtr<IPin> pIPinPeerOf;
+			if (FAILED(hr = pIEnumPins->Next(1, &pIPin, 0)) || hr != S_OK) {
+				// ループ終わり
+				break;
+			}
+			// ピンが接続済だったら切断
+
+			if (SUCCEEDED(hr = pIPin->ConnectedTo(&pIPinPeerOf))) {
+				hr = m_pIGraphBuilder->Disconnect(pIPinPeerOf);
+				hr = m_pIGraphBuilder->Disconnect(pIPin);
+			}
 		}
 	}
 }

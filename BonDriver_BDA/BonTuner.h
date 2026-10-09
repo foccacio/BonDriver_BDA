@@ -19,13 +19,6 @@
 #include "DSFilterEnum.h"
 #include "TSMF.h"
 
-#pragma warning (push)
-#pragma warning (disable: 4310)
-#include "..\3rdParties\muparser\include\muParser.h"
-#pragma warning (pop)
-
-#pragma comment(lib, "muparser.lib")
-
 struct ITsWriter;
 
 // CBonTuner class
@@ -117,10 +110,6 @@ protected:
 	// ini ファイル読込
 	void ReadIniFile(void);
 
-	// 電源プラン変更用
-	void PowerSetOnOpened(void);
-	void PowerSetOnClosing(void);
-
 	// 信号状態を取得
 	void GetSignalState(int* pnStrength, int* pnQuality, int* pnLock);
 
@@ -134,7 +123,7 @@ protected:
 	HRESULT CheckCapture(std::wstring tunerGUID, std::wstring tunerFriendlyName, std::wstring captureGUID, std::wstring captureFriendlyName);
 		
 	// チューナ固有関数のロード
-	void LoadTunerDependCode(std::wstring tunerGUID, std::wstring tunerFriendlyName, std::wstring captureGUID, std::wstring captureFriendlyName);
+	void LoadTunerDependCode(void);
 
 	// チューナ固有関数とDllの解放
 	void ReleaseTunerDependCode(void);
@@ -182,9 +171,25 @@ protected:
 	HRESULT LoadAndConnectMiscFilters(IBaseFilter* pTunerDevice, IBaseFilter* pCaptureDevice);
 
 	// チューナ信号状態取得用インターフェース
-	HRESULT LoadTunerSignalStatisticsTunerNode(void);
-	HRESULT LoadTunerSignalStatisticsDemodNode(void);
+	HRESULT LoadTunerSignalStatistics(void);
 	void UnloadTunerSignalStatistics(void);
+
+	// TBS拡張プロパティ(KSPROPERTY_BDA_SIGNAL_STATUS)で取得されるデータ
+	//   TBS製チューナでの実測結果に基づくもので、公開された仕様ではない
+	struct TBSSignalStatus {
+		LONG lStrength;		// +00: 信号強度(入力レベル) dBm単位の符号付き整数 (例: 0xFFFFFFBF → -65dBm)
+		LONG lSNR;			// +04: SNR 0.1dB単位 (例: 168 → 16.8dB)
+		LONG lBER;			// +08: BER 10^-7単位 (例: 39200 → 0.003920) ※受信する衛星によっては常に固定値となる
+	};
+	static_assert(sizeof(TBSSignalStatus) == 12, "TBSSignalStatus must be 12 bytes.");
+
+	// TBS拡張プロパティ(KSPROPERTY_BDA_SIGNAL_STATUS)取得用インターフェース
+	HRESULT LoadTunerTBSSignalStatus(void);
+	void UnloadTunerTBSSignalStatus(void);
+
+	// TBS拡張プロパティ(KSPROPERTY_BDA_SIGNAL_STATUS)で信号状態を取得
+	HRESULT GetTBSSignalStatus(TBSSignalStatus *pStatus);
+	static HRESULT GetTBSSignalStatusSub(IKsPropertySet *pIKsPropertySet, BOOL *pbWithInstanceData, TBSSignalStatus *pStatus, DWORD *pdwReturned);
 
 	// Pin の接続
 	HRESULT Connect(IBaseFilter* pFrom, IBaseFilter* pTo);
@@ -500,35 +505,32 @@ protected:
 	// SignalLevel 算出方法
 	enum enumSignalLevelCalcType {
 		eSignalLevelCalcTypeSSMin = 0,
-		eSignalLevelCalcTypeSSStrength = 0,			// RF Tuner NodeのIBDA_SignalStatisticsから取得したStrength値 ÷ StrengthCoefficient ＋ StrengthBias
-		eSignalLevelCalcTypeSSQuality = 1,			// RF Tuner NodeのIBDA_SignalStatisticsから取得したQuality値 ÷ QualityCoefficient ＋ QualityBias
-		eSignalLevelCalcTypeSSMul = 2,				// RF Tuner NodeのIBDA_SignalStatisticsから取得した(Strength値 ÷ StrengthCoefficient ＋ StrengthBias) × (Quality値 ÷ QualityCoefficient ＋ QualityBias)
-		eSignalLevelCalcTypeSSAdd = 3,				// RF Tuner NodeのIBDA_SignalStatisticsから取得した(Strength値 ÷ StrengthCoefficient ＋ StrengthBias) ＋ (Quality値 ÷ QualityCoefficient ＋ QualityBias)
-		eSignalLevelCalcTypeSSFormula = 9,			// RF Tuner NodeのIBDA_SignalStatisticsから取得したStrength/Quality値をSignalLevelCalcFormulaに設定したユーザー定義数式で算出
+		eSignalLevelCalcTypeSSStrength = 0,		// IBDA_SignalStatistics::get_SignalStrengthで取得した値 ÷ StrengthCoefficientで指定した数値 ＋ StrengthBiasで指定した数値
+		eSignalLevelCalcTypeSSQuality = 1,		// IBDA_SignalStatistics::get_SignalQualityで取得した値 ÷ QualityCoefficientで指定した数値 ＋ QualityBiasで指定した数値
+		eSignalLevelCalcTypeSSMul = 2,			// (IBDA_SignalStatistics::get_SignalStrength ÷ StrengthCoefficient ＋ StrengthBias) × (IBDA_SignalStatistics::get_SignalQuality ÷ QualityCoefficient ＋ QualityBias)
+		eSignalLevelCalcTypeSSAdd = 3,			// (IBDA_SignalStatistics::get_SignalStrength ÷ StrengthCoefficient ＋ StrengthBias) ＋ (IBDA_SignalStatistics::get_SignalQuality ÷ QualityCoefficient ＋ QualityBias)
 		eSignalLevelCalcTypeSSMax = 9,
 		eSignalLevelCalcTypeTunerMin = 10,
-		eSignalLevelCalcTypeTunerStrength = 10,		// ITuner::get_SignalStrengthで取得したStrength値 ÷ StrengthCoefficient ＋ StrengthBias
-		eSignalLevelCalcTypeTunerQuality = 11,		// ITuner::get_SignalStrengthで取得したQuality値 ÷ QualityCoefficient ＋ QualityBias
-		eSignalLevelCalcTypeTunerMul = 12,			// ITuner::get_SignalStrengthで取得した(Strength値 ÷ StrengthCoefficient ＋ StrengthBias) × (Quality値 ÷ QualityCoefficient ＋ QualityBias)
-		eSignalLevelCalcTypeTunerAdd = 13,			// ITuner::get_SignalStrengthで取得した(Strength値 ÷ StrengthCoefficient ＋ StrengthBias) ＋ (Quality値 ÷ QualityCoefficient ＋ QualityBias)
-		eSignalLevelCalcTypeTunerFormula = 19,		// ITuner::get_SignalStrengthで取得したStrength/Quality値をSignalLevelCalcFormulaに設定したユーザー定義数式で算出
+		eSignalLevelCalcTypeTunerStrength = 10,	// ITuner::get_SignalStrengthで取得したStrength値 ÷ StrengthCoefficientで指定した数値 ＋ StrengthBiasで指定した数値
+		eSignalLevelCalcTypeTunerQuality = 11,	// ITuner::get_SignalStrengthで取得したQuality値 ÷ QualityCoefficientで指定した数値 ＋ QualityBiasで指定した数値
+		eSignalLevelCalcTypeTunerMul = 12,		// (ITuner::get_SignalStrengthのStrength値 ÷ StrengthCoefficient ＋ StrengthBias) × (ITuner::get_SignalStrengthのQuality値 ÷ QualityCoefficient ＋ QualityBias)
+		eSignalLevelCalcTypeTunerAdd = 13,		// (ITuner::get_SignalStrengthのStrength値 ÷ StrengthCoefficient ＋ StrengthBias) ＋ (ITuner::get_SignalStrengthのQuality値 ÷ QualityCoefficient ＋ QualityBias)
 		eSignalLevelCalcTypeTunerMax = 19,
-		eSignalLevelCalcTypeDemodSSMin = 20,
-		eSignalLevelCalcTypeDemodSSStrength = 20,	// Demodulator NodeのIBDA_SignalStatisticsから取得したStrength値 ÷ StrengthCoefficient ＋ StrengthBias
-		eSignalLevelCalcTypeDemodSSQuality = 21,	// Demodulator NodeのIBDA_SignalStatisticsから取得したQuality値 ÷ QualityCoefficient ＋ QualityBias
-		eSignalLevelCalcTypeDemodSSMul = 22,		// Demodulator NodeのIBDA_SignalStatisticsから取得した(Strength値 ÷ StrengthCoefficient ＋ StrengthBias) × (Quality値 ÷ QualityCoefficient ＋ QualityBias)
-		eSignalLevelCalcTypeDemodSSAdd = 23,		// Demodulator NodeのIBDA_SignalStatisticsから取得した(Strength値 ÷ StrengthCoefficient ＋ StrengthBias) ＋ (Quality値 ÷ QualityCoefficient ＋ QualityBias)
-		eSignalLevelCalcTypeDemodSSFormula = 29,	// Demodulator NodeのIBDA_SignalStatisticsから取得したStrength/Quality値をSignalLevelCalcFormulaに設定したユーザー定義数式で算出
-		eSignalLevelCalcTypeDemodSSMax = 29,
-		eSignalLevelCalcTypeBR = 100,				// ビットレート値(Mibps)
+		eSignalLevelCalcTypeTBSMin = 20,
+		eSignalLevelCalcTypeTBSStrength = 20,	// TBS拡張プロパティ(KSPROPERTY_BDA_SIGNAL_STATUS)で取得した信号強度(dBm) ÷ StrengthCoefficientで指定した数値 ＋ StrengthBiasで指定した数値
+		eSignalLevelCalcTypeTBSQuality = 21,	// TBS拡張プロパティ(KSPROPERTY_BDA_SIGNAL_STATUS)で取得したSNR(dB) ÷ QualityCoefficientで指定した数値 ＋ QualityBiasで指定した数値
+		eSignalLevelCalcTypeTBSMax = 29,
+		eSignalLevelCalcTypeBR = 100,			// ビットレート値(Mibps)
 	};
 	enumSignalLevelCalcType m_nSignalLevelCalcType;
-	BOOL m_bSignalLevelGetTypeSS;			// SignalLevel 算出に RF Tuner Node の IBDA_SignalStatistics を使用する
-	BOOL m_bSignalLevelGetTypeTuner;		// SignalLevel 算出に ITuner を使用する
-	BOOL m_bSignalLevelGetTypeDemodSS;		// SignalLevel 算出に Demodulator Node の IBDA_SignalStatistics を使用する
-	BOOL m_bSignalLevelGetTypeBR;			// SignalLevel 算出に ビットレート値を使用する
-	BOOL m_bSignalLevelNeedStrength;		// SignalLevel 算出に SignalStrength 値を使用する
-	BOOL m_bSignalLevelNeedQuality;			// SignalLevel 算出に SignalQuality 値を使用する
+	BOOL m_bSignalLevelGetTypeSS;		// SignalLevel 算出に IBDA_SignalStatistics を使用する
+	BOOL m_bSignalLevelGetTypeTuner;	// SignalLevel 算出に ITuner を使用する
+	BOOL m_bSignalLevelGetTypeTBS;		// SignalLevel 算出に TBS拡張プロパティ(KSPROPERTY_BDA_SIGNAL_STATUS) を使用する
+	BOOL m_bSignalLevelGetTypeBR;		// SignalLevel 算出に ビットレート値を使用する
+	BOOL m_bSignalLevelNeedStrength;	// SignalLevel 算出に SignalStrength 値を使用する
+	BOOL m_bSignalLevelNeedQuality;		// SignalLevel 算出に SignalQuality 値を使用する
+	BOOL m_bSignalLevelCalcTypeMul;		// SignalLevel 算出に SignalStrength と SignalQuality の掛け算を使用する
+	BOOL m_bSignalLevelCalcTypeAdd;		// SignalLevel 算出に SignalStrength と SignalQuality の足し算を使用する
 
 	// Strength 値補正係数
 	double m_fStrengthCoefficient;
@@ -542,25 +544,15 @@ protected:
 	// Quality 値補正バイアス
 	double m_fQualityBias;
 
-	// SignalLevel算出用ユーザー定義数式
-	std::wstring m_sSignalLevelCalcFormula;
-
-	// SignalLevel算出用
-	mu::Parser m_muParser;	// muparser
-	double m_fStrength;		// muparser用Strength値参照変数
-	double m_fQuality;		// muparser用Quality値参照変数
-
 	// チューニング状態の判断方法
 	enum enumSignalLockedJudgeType {
 		eSignalLockedJudgeTypeAlways = 0,	// 常にチューニングに成功している状態として判断する
-		eSignalLockedJudgeTypeSS = 1,		// RF Tuner Node の IBDA_SignalStatistics::get_SignalLockedで取得した値で判断する
+		eSignalLockedJudgeTypeSS = 1,		// IBDA_SignalStatistics::get_SignalLockedで取得した値で判断する
 		eSignalLockedJudgeTypeTuner = 2,	// ITuner::get_SignalStrengthで取得した値で判断する
-		eSignalLockedJudgeTypeDemodSS = 3,	// Demodulator Node の IBDA_SignalStatistics::get_SignalLockedで取得した値で判断する
 	};
 	enumSignalLockedJudgeType m_nSignalLockedJudgeType;
-	BOOL m_bSignalLockedJudgeTypeSS;		// チューニング状態の判断に IBDA_SignalStatistics を使用する
-	BOOL m_bSignalLockedJudgeTypeTuner;		// チューニング状態の判断に ITuner を使用する
-	BOOL m_bSignalLockedJudgeTypeDemodSS;	// チューニング状態の判断に Demodulator Node の IBDA_SignalStatistics を使用する
+	BOOL m_bSignalLockedJudgeTypeSS;	// チューニング状態の判断に IBDA_SignalStatistics を使用する
+	BOOL m_bSignalLockedJudgeTypeTuner;	// チューニング状態の判断に ITuner を使用する
 
 	////////////////////////////////////////
 	// BonDriver パラメータ関係
@@ -577,9 +569,6 @@ protected:
 
 	// WaitTsStreamで最低限待機する時間
 	unsigned int m_nWaitTsSleep;
-
-	// ヌルパケットを削除するかどうか
-	BOOL m_bDeleteNullPackets;
 
 	// SetChannel()でチャンネルロックに失敗した場合でもFALSEを返さないようにするかどうか
 	BOOL m_bAlwaysAnswerLocked;
@@ -849,16 +838,6 @@ protected:
 	// チューナデバイス排他処理用
 	HANDLE m_hSemaphore;
 
-	// 電源プラン変更用のミューテックスオブジェクト名
-	// 他ツールと協調する場合に備えて、一般的な名前"PowerSet～"にランダムGUIDを付加して命名
-	static constexpr WCHAR POWER_SET_FLAG_NAME[] = L"Global\\PowerSetFlag-D112FE9C-2CC3-4AEE-83E3-458C65CF592C";
-	static constexpr WCHAR POWER_SET_LOCK_NAME[] = L"Global\\PowerSetLock-D112FE9C-2CC3-4AEE-83E3-458C65CF592C";
-	static constexpr DWORD POWER_SET_WAIT_MSEC = 10000;
-
-	// 電源プラン変更用
-	HANDLE m_hPowerSetFlag;
-	HANDLE m_hPowerSetLock;
-
 	// Graph
 	CComPtr<IGraphBuilder> m_pIGraphBuilder;	// Filter Graph Manager の IGraphBuilder interface
 	CComPtr<IMediaControl> m_pIMediaControl;	// Filter Graph Manager の IMediaControl interface
@@ -871,12 +850,17 @@ protected:
 	CComPtr<IBaseFilter> m_pDemux;				// MPEG2 Demultiplexer の IBaseFilter interface
 	CComPtr<IBaseFilter> m_pTif;				// MPEG2 Transport Information Filter の IBaseFilter interface
 
-	// RunningObjectTableの登録ID
-	DWORD m_dwROTRegister;
-
 	// チューナ信号状態取得用インターフェース
-	CComPtr<IBDA_SignalStatistics> m_pIBDA_SignalStatisticsTunerNode;
-	CComPtr<IBDA_SignalStatistics> m_pIBDA_SignalStatisticsDemodNode;
+	CComPtr<IBDA_SignalStatistics> m_pIBDA_SignalStatistics;
+
+	// TBS拡張プロパティ(KSPROPERTY_BDA_SIGNAL_STATUS)取得用インターフェース
+	CComPtr<IKsPropertySet> m_pIKsPropertySetTBS;
+
+	// KSPROPERTY_BDA_SIGNAL_STATUS 取得時に instance data を付加するかどうか
+	BOOL m_bTBSSignalStatusWithInstanceData;
+
+	// KSPROPERTY_BDA_SIGNAL_STATUS の直前の取得結果 (-1: 未取得, 0: 失敗, 1: 成功) ... デバッグログ出力の制御用
+	int m_nTBSSignalStatusLastResult;
 
 	// DSフィルター列挙 CDSFilterEnum
 	CDSFilterEnum *m_pDSFilterEnumTuner;
@@ -1058,13 +1042,6 @@ protected:
 	};
 	enumDefaultNetwork m_nDefaultNetwork;
 
-	// フィルタグラフをRunningObjectTableに登録するかどうか
-	BOOL m_bRegisterGraphInROT;
-
-	// 電源プラン変更のGUID
-	std::wstring m_sPowerSetOnOpenedGUID;
-	std::wstring m_sPowerSetOnClosingGUID;
-
 	// Tuner is opened
 	BOOL m_bOpened;
 
@@ -1095,15 +1072,6 @@ protected:
 	// TSMF処理が必要
 	BOOL m_bIsEnabledTSMF;
 
-	// ヌルパケット削除処理をリセット
-	LONG m_lResetFilter;
-
-	// TSパケットサイズ(ヌルパケット削除用)
-	size_t m_PacketSize;
-
-	// 前回処理したTSパケットバッファおよび作業用(ヌルパケット削除用)
-	std::vector<BYTE> m_FilterBuf;
-
 	// 最後にLockChannelを行った時のチューニングパラメータ
 	TuningParam m_LastTuningParam;
 
@@ -1112,7 +1080,7 @@ protected:
 
 	// チューナ固有関数 IBdaSpecials
 	IBdaSpecials *m_pIBdaSpecials;
-	IBdaSpecials2b5 *m_pIBdaSpecials2;
+	IBdaSpecials2b2 *m_pIBdaSpecials2;
 
 	// チューナ固有の関数が必要かどうかを自動判別するDB
 	// GUID をキーに DLL 名を得る
